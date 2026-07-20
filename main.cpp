@@ -13,7 +13,7 @@
 using namespace std;
 
 const int MAX_KEY_LEN = 64;
-const int HASH_SIZE = 100003;  // prime number
+const int HASH_SIZE = 200003;  // larger prime number
 const string DATA_FILE = "data.bin";
 const string INDEX_FILE = "index.bin";
 
@@ -93,13 +93,8 @@ public:
         // Ensure index file is correct size
         fstat(indexFd, &st);
         if (st.st_size < HASH_SIZE * sizeof(int32_t)) {
-            // Initialize index file
+            // Resize file
             ftruncate(indexFd, HASH_SIZE * sizeof(int32_t));
-            lseek(indexFd, 0, SEEK_SET);
-            int32_t initVal = -1;
-            for (int i = 0; i < HASH_SIZE; i++) {
-                write(indexFd, &initVal, sizeof(initVal));
-            }
         }
         
         // Memory map index file
@@ -108,6 +103,13 @@ public:
         if (index == MAP_FAILED) {
             cerr << "Failed to mmap index file" << endl;
             exit(1);
+        }
+        
+        // Initialize if file was newly created or resized
+        if (st.st_size < HASH_SIZE * sizeof(int32_t)) {
+            for (int i = 0; i < HASH_SIZE; i++) {
+                index[i] = -1;
+            }
         }
     }
     
