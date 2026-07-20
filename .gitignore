@@ -1,0 +1,13 @@
+CMakeFiles/
+CMakeCache.txt
+code
+*.o
+*.so
+*.a
+*.dylib
+.DS_Store
+build/
+.vscode/
+.idea/
+__pycache__/
+*.pyc
