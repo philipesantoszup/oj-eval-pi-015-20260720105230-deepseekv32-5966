@@ -41,6 +41,11 @@ private:
     // Memory-mapped index
     int32_t* index = nullptr;
     
+    // Simple cache for last accessed key
+    string cachedKey;
+    vector<int32_t> cachedValues;
+    bool cacheValid = false;
+    
     size_t hashKey(const string& key) const {
         size_t hash = 0;
         for (char c : key) {
@@ -143,6 +148,11 @@ public:
         
         streampos newPos = appendRecord(newRec);
         index[hash] = newPos;  // update head
+        
+        // Invalidate cache for this key
+        if (cachedKey == key) {
+            cacheValid = false;
+        }
     }
     
     void remove(const string& key, int32_t value) {
@@ -166,6 +176,10 @@ public:
                     prevRec.next = rec.next;
                     writeRecord(prevPos, prevRec);
                 }
+                // Invalidate cache for this key
+                if (cachedKey == key) {
+                    cacheValid = false;
+                }
                 return;
             }
             
@@ -175,6 +189,11 @@ public:
     }
     
     vector<int32_t> find(const string& key) {
+        // Check cache first
+        if (cacheValid && cachedKey == key) {
+            return cachedValues;
+        }
+        
         vector<int32_t> result;
         
         size_t hash = hashKey(key);
@@ -192,6 +211,12 @@ public:
         }
         
         sort(result.begin(), result.end());
+        
+        // Update cache
+        cachedKey = key;
+        cachedValues = result;
+        cacheValid = true;
+        
         return result;
     }
 };
