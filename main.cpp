@@ -1,107 +1,195 @@
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <algorithm>
-#include <unordered_map>
-#include <set>
-#include <fstream>
+#include <cstring>
+#include <cstdint>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 using namespace std;
 
-const string STATE_FILE = "state.bin";
+const int MAX_KEY_LEN = 64;
+const int HASH_SIZE = 100003;  // prime number
+const string DATA_FILE = "data.bin";
+const string INDEX_FILE = "index.bin";
 
-// Simple file-based storage that persists state
-class PersistentStorage {
-private:
-    unordered_map<string, set<int>> data;
-    bool loaded = false;
+struct Record {
+    char key[MAX_KEY_LEN + 1];
+    int32_t value;
+    int32_t next;  // next position in file (-1 if none)
     
-    void loadState() {
-        if (loaded) return;
-        
-        ifstream file(STATE_FILE, ios::binary);
-        if (!file) {
-            loaded = true;
-            return;
-        }
-        
-        int size;
-        file.read(reinterpret_cast<char*>(&size), sizeof(size));
-        
-        for (int i = 0; i < size; i++) {
-            // Read key length
-            int keyLen;
-            file.read(reinterpret_cast<char*>(&keyLen), sizeof(keyLen));
-            
-            // Read key
-            string key(keyLen, ' ');
-            file.read(&key[0], keyLen);
-            
-            // Read values count
-            int valCount;
-            file.read(reinterpret_cast<char*>(&valCount), sizeof(valCount));
-            
-            // Read values
-            for (int j = 0; j < valCount; j++) {
-                int value;
-                file.read(reinterpret_cast<char*>(&value), sizeof(value));
-                data[key].insert(value);
-            }
-        }
-        
-        loaded = true;
+    Record() : value(0), next(-1) {
+        memset(key, 0, sizeof(key));
     }
     
-    void saveState() {
-        ofstream file(STATE_FILE, ios::binary);
-        
-        int size = data.size();
-        file.write(reinterpret_cast<char*>(&size), sizeof(size));
-        
-        for (const auto& [key, values] : data) {
-            int keyLen = key.size();
-            file.write(reinterpret_cast<char*>(&keyLen), sizeof(keyLen));
-            file.write(key.c_str(), keyLen);
-            
-            int valCount = values.size();
-            file.write(reinterpret_cast<char*>(&valCount), sizeof(valCount));
-            
-            for (int val : values) {
-                file.write(reinterpret_cast<char*>(&val), sizeof(val));
-            }
+    Record(const string& k, int32_t v) : value(v), next(-1) {
+        strncpy(key, k.c_str(), MAX_KEY_LEN);
+        key[MAX_KEY_LEN] = '\0';
+    }
+};
+
+class DiskStorage {
+private:
+    int dataFd = -1;
+    int indexFd = -1;
+    size_t dataSize = 0;
+    
+    // Memory-mapped index
+    int32_t* index = nullptr;
+    
+    size_t hashKey(const string& key) const {
+        size_t hash = 0;
+        for (char c : key) {
+            hash = hash * 31 + c;
         }
+        return hash % HASH_SIZE;
+    }
+    
+    streampos appendRecord(const Record& rec) {
+        lseek(dataFd, 0, SEEK_END);
+        streampos pos = lseek(dataFd, 0, SEEK_CUR);
+        
+        write(dataFd, &rec, sizeof(rec));
+        dataSize += sizeof(rec);
+        
+        return pos;
+    }
+    
+    void readRecord(streampos pos, Record& rec) {
+        lseek(dataFd, pos, SEEK_SET);
+        read(dataFd, &rec, sizeof(rec));
+    }
+    
+    void writeRecord(streampos pos, const Record& rec) {
+        lseek(dataFd, pos, SEEK_SET);
+        write(dataFd, &rec, sizeof(rec));
     }
     
 public:
-    PersistentStorage() {
-        loadState();
-    }
-    
-    ~PersistentStorage() {
-        saveState();
-    }
-    
-    void insert(const string& key, int value) {
-        data[key].insert(value);
-    }
-    
-    void remove(const string& key, int value) {
-        auto it = data.find(key);
-        if (it != data.end()) {
-            it->second.erase(value);
-            if (it->second.empty()) {
-                data.erase(it);
-            }
-        }
-    }
-    
-    vector<int> find(const string& key) {
-        auto it = data.find(key);
-        if (it == data.end()) {
-            return {};
+    DiskStorage() {
+        // Open data file
+        dataFd = open(DATA_FILE.c_str(), O_RDWR | O_CREAT, 0644);
+        if (dataFd < 0) {
+            cerr << "Failed to open data file" << endl;
+            exit(1);
         }
         
-        vector<int> result(it->second.begin(), it->second.end());
+        // Get data file size
+        struct stat st;
+        fstat(dataFd, &st);
+        dataSize = st.st_size;
+        
+        // Open and map index file
+        indexFd = open(INDEX_FILE.c_str(), O_RDWR | O_CREAT, 0644);
+        if (indexFd < 0) {
+            cerr << "Failed to open index file" << endl;
+            exit(1);
+        }
+        
+        // Ensure index file is correct size
+        fstat(indexFd, &st);
+        if (st.st_size < HASH_SIZE * sizeof(int32_t)) {
+            // Initialize index file
+            ftruncate(indexFd, HASH_SIZE * sizeof(int32_t));
+            lseek(indexFd, 0, SEEK_SET);
+            int32_t initVal = -1;
+            for (int i = 0; i < HASH_SIZE; i++) {
+                write(indexFd, &initVal, sizeof(initVal));
+            }
+        }
+        
+        // Memory map index file
+        index = (int32_t*)mmap(nullptr, HASH_SIZE * sizeof(int32_t),
+                              PROT_READ | PROT_WRITE, MAP_SHARED, indexFd, 0);
+        if (index == MAP_FAILED) {
+            cerr << "Failed to mmap index file" << endl;
+            exit(1);
+        }
+    }
+    
+    ~DiskStorage() {
+        if (dataFd >= 0) close(dataFd);
+        if (indexFd >= 0) {
+            munmap(index, HASH_SIZE * sizeof(int32_t));
+            close(indexFd);
+        }
+    }
+    
+    void insert(const string& key, int32_t value) {
+        // Check if exists first
+        size_t hash = hashKey(key);
+        int32_t pos = index[hash];
+        
+        while (pos != -1) {
+            Record rec;
+            readRecord(pos, rec);
+            
+            if (strcmp(rec.key, key.c_str()) == 0 && rec.value == value) {
+                return;  // Already exists
+            }
+            
+            pos = rec.next;
+        }
+        
+        // Append new record
+        Record newRec(key, value);
+        newRec.next = index[hash];  // point to current head
+        
+        streampos newPos = appendRecord(newRec);
+        index[hash] = newPos;  // update head
+    }
+    
+    void remove(const string& key, int32_t value) {
+        size_t hash = hashKey(key);
+        int32_t pos = index[hash];
+        int32_t prevPos = -1;
+        
+        while (pos != -1) {
+            Record rec;
+            readRecord(pos, rec);
+            
+            if (strcmp(rec.key, key.c_str()) == 0 && rec.value == value) {
+                // Found record to delete
+                if (prevPos == -1) {
+                    // Update head
+                    index[hash] = rec.next;
+                } else {
+                    // Update previous record's next pointer
+                    Record prevRec;
+                    readRecord(prevPos, prevRec);
+                    prevRec.next = rec.next;
+                    writeRecord(prevPos, prevRec);
+                }
+                return;
+            }
+            
+            prevPos = pos;
+            pos = rec.next;
+        }
+    }
+    
+    vector<int32_t> find(const string& key) {
+        vector<int32_t> result;
+        
+        size_t hash = hashKey(key);
+        int32_t pos = index[hash];
+        
+        while (pos != -1) {
+            Record rec;
+            readRecord(pos, rec);
+            
+            if (strcmp(rec.key, key.c_str()) == 0) {
+                result.push_back(rec.value);
+            }
+            
+            pos = rec.next;
+        }
+        
+        sort(result.begin(), result.end());
         return result;
     }
 };
@@ -110,7 +198,7 @@ int main() {
     ios_base::sync_with_stdio(false);
     cin.tie(nullptr);
     
-    PersistentStorage storage;
+    DiskStorage storage;
     int n;
     cin >> n;
     
@@ -120,20 +208,20 @@ int main() {
         
         if (command == "insert") {
             string key;
-            int value;
+            int32_t value;
             cin >> key >> value;
             storage.insert(key, value);
             
         } else if (command == "delete") {
             string key;
-            int value;
+            int32_t value;
             cin >> key >> value;
             storage.remove(key, value);
             
         } else if (command == "find") {
             string key;
             cin >> key;
-            vector<int> values = storage.find(key);
+            vector<int32_t> values = storage.find(key);
             
             if (values.empty()) {
                 cout << "null\n";
