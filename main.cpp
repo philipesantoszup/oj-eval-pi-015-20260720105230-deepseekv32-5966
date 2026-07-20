@@ -13,38 +13,36 @@
 using namespace std;
 
 const int MAX_KEY_LEN = 64;
-const int HASH_SIZE = 200003;  // larger prime number
+const int HASH_SIZE = 200003;
 const string DATA_FILE = "data.bin";
 const string INDEX_FILE = "index.bin";
 
-struct Record {
+struct ValueRecord {
     char key[MAX_KEY_LEN + 1];
-    int32_t value;
-    int32_t next;  // next position in file (-1 if none)
+    int32_t count;
+    int32_t values[0];  // flexible array
     
-    Record() : value(0), next(-1) {
+    ValueRecord() : count(0) {
         memset(key, 0, sizeof(key));
     }
     
-    Record(const string& k, int32_t v) : value(v), next(-1) {
+    ValueRecord(const string& k) : count(0) {
         strncpy(key, k.c_str(), MAX_KEY_LEN);
         key[MAX_KEY_LEN] = '\0';
     }
+    
+    size_t size() const {
+        return sizeof(ValueRecord) + count * sizeof(int32_t);
+    }
 };
 
-class DiskStorage {
+class FastStorage {
 private:
     int dataFd = -1;
     int indexFd = -1;
-    size_t dataSize = 0;
     
     // Memory-mapped index
     int32_t* index = nullptr;
-    
-    // Simple cache for last accessed key
-    string cachedKey;
-    vector<int32_t> cachedValues;
-    bool cacheValid = false;
     
     size_t hashKey(const string& key) const {
         size_t hash = 0;
@@ -54,63 +52,63 @@ private:
         return hash % HASH_SIZE;
     }
     
-    streampos appendRecord(const Record& rec) {
+    streampos appendData(const void* data, size_t size) {
         lseek(dataFd, 0, SEEK_END);
         streampos pos = lseek(dataFd, 0, SEEK_CUR);
-        
-        write(dataFd, &rec, sizeof(rec));
-        dataSize += sizeof(rec);
-        
+        write(dataFd, data, size);
         return pos;
     }
     
-    void readRecord(streampos pos, Record& rec) {
+    void readData(streampos pos, void* data, size_t size) {
         lseek(dataFd, pos, SEEK_SET);
-        read(dataFd, &rec, sizeof(rec));
+        read(dataFd, data, size);
     }
     
-    void writeRecord(streampos pos, const Record& rec) {
+    void writeData(streampos pos, const void* data, size_t size) {
         lseek(dataFd, pos, SEEK_SET);
-        write(dataFd, &rec, sizeof(rec));
+        write(dataFd, data, size);
+    }
+    
+    void deleteRecord(streampos pos) {
+        // Mark as deleted
+        int32_t marker = -1;
+        writeData(pos + offsetof(ValueRecord, count), &marker, sizeof(marker));
+    }
+    
+    vector<int32_t> getValues(const string& key, streampos pos) {
+        // Read count
+        int32_t count;
+        readData(pos + offsetof(ValueRecord, count), &count, sizeof(count));
+        
+        if (count <= 0) {
+            return {};
+        }
+        
+        // Read values
+        vector<int32_t> values(count);
+        readData(pos + (streampos)sizeof(ValueRecord), values.data(), count * sizeof(int32_t));
+        
+        return values;
     }
     
 public:
-    DiskStorage() {
-        // Open data file
+    FastStorage() {
         dataFd = open(DATA_FILE.c_str(), O_RDWR | O_CREAT, 0644);
-        if (dataFd < 0) {
-            cerr << "Failed to open data file" << endl;
-            exit(1);
-        }
+        if (dataFd < 0) exit(1);
         
-        // Get data file size
-        struct stat st;
-        fstat(dataFd, &st);
-        dataSize = st.st_size;
-        
-        // Open and map index file
         indexFd = open(INDEX_FILE.c_str(), O_RDWR | O_CREAT, 0644);
-        if (indexFd < 0) {
-            cerr << "Failed to open index file" << endl;
-            exit(1);
-        }
+        if (indexFd < 0) exit(1);
         
-        // Ensure index file is correct size
+        struct stat st;
         fstat(indexFd, &st);
         if (st.st_size < HASH_SIZE * sizeof(int32_t)) {
-            // Resize file
             ftruncate(indexFd, HASH_SIZE * sizeof(int32_t));
         }
         
-        // Memory map index file
         index = (int32_t*)mmap(nullptr, HASH_SIZE * sizeof(int32_t),
                               PROT_READ | PROT_WRITE, MAP_SHARED, indexFd, 0);
-        if (index == MAP_FAILED) {
-            cerr << "Failed to mmap index file" << endl;
-            exit(1);
-        }
+        if (index == MAP_FAILED) exit(1);
         
-        // Initialize if file was newly created or resized
         if (st.st_size < HASH_SIZE * sizeof(int32_t)) {
             for (int i = 0; i < HASH_SIZE; i++) {
                 index[i] = -1;
@@ -118,7 +116,7 @@ public:
         }
     }
     
-    ~DiskStorage() {
+    ~FastStorage() {
         if (dataFd >= 0) close(dataFd);
         if (indexFd >= 0) {
             munmap(index, HASH_SIZE * sizeof(int32_t));
@@ -127,97 +125,90 @@ public:
     }
     
     void insert(const string& key, int32_t value) {
-        // Check if exists first
         size_t hash = hashKey(key);
-        int32_t pos = index[hash];
+        streampos pos = index[hash];
         
-        while (pos != -1) {
-            Record rec;
-            readRecord(pos, rec);
+        if (pos != -1) {
+            char storedKey[MAX_KEY_LEN + 1];
+            readData(pos, storedKey, sizeof(storedKey));
             
-            if (strcmp(rec.key, key.c_str()) == 0 && rec.value == value) {
-                return;  // Already exists
+            if (strcmp(storedKey, key.c_str()) == 0) {
+                vector<int32_t> values = getValues(key, pos);
+                if (std::find(values.begin(), values.end(), value) != values.end()) {
+                    return;
+                }
+                
+                values.push_back(value);
+                sort(values.begin(), values.end());
+                
+                deleteRecord(pos);
+                
+                ValueRecord rec(key);
+                rec.count = values.size();
+                
+                streampos newPos = appendData(&rec, sizeof(rec));
+                appendData(values.data(), values.size() * sizeof(int32_t));
+                
+                index[hash] = newPos;
+                return;
             }
-            
-            pos = rec.next;
         }
         
-        // Append new record
-        Record newRec(key, value);
-        newRec.next = index[hash];  // point to current head
+        vector<int32_t> values = {value};
+        ValueRecord rec(key);
+        rec.count = 1;
         
-        streampos newPos = appendRecord(newRec);
-        index[hash] = newPos;  // update head
+        streampos newPos = appendData(&rec, sizeof(rec));
+        appendData(values.data(), sizeof(int32_t));
         
-        // Invalidate cache for this key
-        if (cachedKey == key) {
-            cacheValid = false;
-        }
+        index[hash] = newPos;
     }
     
     void remove(const string& key, int32_t value) {
         size_t hash = hashKey(key);
-        int32_t pos = index[hash];
-        int32_t prevPos = -1;
+        streampos pos = index[hash];
         
-        while (pos != -1) {
-            Record rec;
-            readRecord(pos, rec);
+        if (pos == -1) return;
+        
+        char storedKey[MAX_KEY_LEN + 1];
+        readData(pos, storedKey, sizeof(storedKey));
+        
+        if (strcmp(storedKey, key.c_str()) != 0) return;
+        
+        vector<int32_t> values = getValues(key, pos);
+        auto it = std::find(values.begin(), values.end(), value);
+        if (it == values.end()) return;
+        
+        values.erase(it);
+        
+        if (values.empty()) {
+            deleteRecord(pos);
+            index[hash] = -1;
+        } else {
+            deleteRecord(pos);
             
-            if (strcmp(rec.key, key.c_str()) == 0 && rec.value == value) {
-                // Found record to delete
-                if (prevPos == -1) {
-                    // Update head
-                    index[hash] = rec.next;
-                } else {
-                    // Update previous record's next pointer
-                    Record prevRec;
-                    readRecord(prevPos, prevRec);
-                    prevRec.next = rec.next;
-                    writeRecord(prevPos, prevRec);
-                }
-                // Invalidate cache for this key
-                if (cachedKey == key) {
-                    cacheValid = false;
-                }
-                return;
-            }
+            ValueRecord rec(key);
+            rec.count = values.size();
             
-            prevPos = pos;
-            pos = rec.next;
+            streampos newPos = appendData(&rec, sizeof(rec));
+            appendData(values.data(), values.size() * sizeof(int32_t));
+            
+            index[hash] = newPos;
         }
     }
     
     vector<int32_t> find(const string& key) {
-        // Check cache first
-        if (cacheValid && cachedKey == key) {
-            return cachedValues;
-        }
-        
-        vector<int32_t> result;
-        
         size_t hash = hashKey(key);
-        int32_t pos = index[hash];
+        streampos pos = index[hash];
         
-        while (pos != -1) {
-            Record rec;
-            readRecord(pos, rec);
-            
-            if (strcmp(rec.key, key.c_str()) == 0) {
-                result.push_back(rec.value);
-            }
-            
-            pos = rec.next;
-        }
+        if (pos == -1) return {};
         
-        sort(result.begin(), result.end());
+        char storedKey[MAX_KEY_LEN + 1];
+        readData(pos, storedKey, sizeof(storedKey));
         
-        // Update cache
-        cachedKey = key;
-        cachedValues = result;
-        cacheValid = true;
+        if (strcmp(storedKey, key.c_str()) != 0) return {};
         
-        return result;
+        return getValues(key, pos);
     }
 };
 
@@ -225,7 +216,7 @@ int main() {
     ios_base::sync_with_stdio(false);
     cin.tie(nullptr);
     
-    DiskStorage storage;
+    FastStorage storage;
     int n;
     cin >> n;
     
